@@ -1,166 +1,27 @@
-name: Terraform Deploy
+name: Test OIDC
 
 on:
   workflow_dispatch:
 
 permissions:
-  contents: read
   id-token: write
-
-env:
-  AWS_REGION: us-east-1
-  AWS_ACCOUNT_ID: '391755178483'
-  TF_VERSION: '1.10.5'
-  TF_IN_AUTOMATION: 'true'
-  TF_INPUT: 'false'
-  STATE_BUCKET: terraform-state-391755178483-us-east-1
-  STATE_KEY: terraform.tfstate
-
-concurrency:
-  group: terraform-production
-  cancel-in-progress: false
+  contents: read
 
 jobs:
-  plan:
-    name: Terraform Plan
+  test:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-          role-session-name: GitHubTerraformPlan
-
-      - name: Verify AWS identity and account
-        shell: bash
+      - name: Show OIDC subject
         run: |
-          set -euo pipefail
-          aws sts get-caller-identity
-          actual=$(aws sts get-caller-identity --query Account --output text)
-          if [[ "$actual" != "$AWS_ACCOUNT_ID" ]]; then
-            echo "Wrong AWS account: $actual (expected $AWS_ACCOUNT_ID)"
-            exit 1
-          fi
+          TOKEN=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r .value)
+          P=$(echo "$TOKEN" | cut -d. -f2)
+          while [ $(( ${#P} % 4 )) -ne 0 ]; do P="${P}="; done
+          echo "$P" | tr '_-' '/+' | base64 -d | jq '{sub, aud, iss}'
 
-      - name: Create or verify Terraform state bucket
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "Checking bucket ownership: $STATE_BUCKET"
-          owned=$(aws s3api list-buckets \
-            --query "Buckets[?Name=='${STATE_BUCKET}'].Name | [0]" \
-            --output text)
-          if [[ "$owned" != "$STATE_BUCKET" ]]; then
-            echo "Bucket not found in this AWS account. Attempting creation."
-            if [[ "$AWS_REGION" == "us-east-1" ]]; then
-              aws s3api create-bucket \
-                --bucket "$STATE_BUCKET" \
-                --region "$AWS_REGION"
-            else
-              aws s3api create-bucket \
-                --bucket "$STATE_BUCKET" \
-                --region "$AWS_REGION" \
-                --create-bucket-configuration "LocationConstraint=$AWS_REGION"
-            fi
-          else
-            echo "Bucket already owned by this account."
-          fi
-
-          aws s3api head-bucket \
-            --bucket "$STATE_BUCKET" \
-            --expected-bucket-owner "$AWS_ACCOUNT_ID"
-
-          aws s3api put-bucket-versioning \
-            --bucket "$STATE_BUCKET" \
-            --versioning-configuration Status=Enabled \
-            --expected-bucket-owner "$AWS_ACCOUNT_ID"
-
-          aws s3api put-public-access-block \
-            --bucket "$STATE_BUCKET" \
-            --public-access-block-configuration \
-              BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true \
-            --expected-bucket-owner "$AWS_ACCOUNT_ID"
-
-          aws s3api put-bucket-encryption \
-            --bucket "$STATE_BUCKET" \
-            --server-side-encryption-configuration \
-              '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}' \
-            --expected-bucket-owner "$AWS_ACCOUNT_ID"
-
-          echo "S3 state bucket is ready."
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
-          terraform_version: ${{ env.TF_VERSION }}
+          role-to-assume: arn:aws:iam::391755178483:role/DD_ROLE
+          aws-region: us-east-1
 
-      - name: Terraform version
-        run: terraform version
-
-      - name: Terraform init
-        run: terraform init -reconfigure -input=false
-
-      - name: Terraform validate
-        run: terraform validate
-
-      - name: Terraform plan
-        run: terraform plan -input=false -out=tfplan
-
-      - name: Upload plan artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: terraform-plan
-          path: tfplan
-          retention-days: 1
-          if-no-files-found: error
-
-  apply:
-    name: Terraform Apply (production approval)
-    runs-on: ubuntu-latest
-    needs: plan
-    environment: production
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-          role-session-name: GitHubTerraformApply
-
-      - name: Verify AWS identity and account
-        shell: bash
-        run: |
-          set -euo pipefail
-          aws sts get-caller-identity
-          actual=$(aws sts get-caller-identity --query Account --output text)
-          if [[ "$actual" != "$AWS_ACCOUNT_ID" ]]; then
-            echo "Wrong AWS account: $actual (expected $AWS_ACCOUNT_ID)"
-            exit 1
-          fi
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ env.TF_VERSION }}
-
-      - name: Terraform version
-        run: terraform version
-
-      - name: Terraform init
-        run: terraform init -reconfigure -input=false
-
-      - name: Download plan artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: terraform-plan
-          path: .
-
-      - name: Terraform apply
-        run: terraform apply -input=false tfplan
+      - run: aws sts get-caller-identity
